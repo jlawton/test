@@ -1,6 +1,7 @@
 # Tools and Scripts
 
 [gh](man/gh.1.md) [[source](bin/gh)] -- Open GitHub
+[semver](man/semver.1.md) [[source](bin/semver)] -- Operate on Semantic Versions
 
 ## Installation
 
