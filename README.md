@@ -1,8 +1,8 @@
 # Tools and Scripts
 
-[gh](man/gh.1.md) [[source](bin/gh)] -- Open GitHub
-[git-release](man/git-release.1.md) [[source](bin/git-release)] -- Create GitHub releases
-[semver](man/semver.1.md) [[source](bin/semver)] -- Operate on Semantic Versions
+* [gh](man/gh.1.md) [[source](bin/gh)] -- Open GitHub
+* [git-release](man/git-release.1.md) [[source](bin/git-release)] -- Create GitHub releases
+* [semver](man/semver.1.md) [[source](bin/semver)] -- Operate on Semantic Versions
 
 ## Installation
 
