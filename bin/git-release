@@ -1,0 +1,525 @@
+#!/bin/bash
+# git-release
+
+help() {
+  cat <<- EOM
+	Usage: $(basename $0) [-a] [-d (true|false)] [-h] [-p] [-t] [-v <version>] [-x] [<commit>]
+
+	 -a               Create an annotated tag, with the changelog as the message.
+	 -d (true|false)  If true, create a draft release.
+	 -h               Show this help and exit.
+	 -p               Print resolved version and exit.
+	 -t               Tag only. Don't create a GitHub release.
+	 -v <version>     Force a version number.
+	 -x               EXPERIMENTAL Offline mode. Doesn't create a GitHub release
+	                  or read GitHub Pull Requests for version annotations.
+
+	 <commit>         The commit to release. Defaults to HEAD.
+
+	ENVIRONMENT VARIABLES
+	
+	 \$EDITOR ($([ "$USING_DEFAULT_EDITOR" -ne '0' ] && echo 'Defaulting to' || echo 'Currently:') '${EDITOR}')
+	   The editor to use for the release message. Editor should block until
+	   editing is complete. Defaults to '$DEFAULT_EDITOR'.
+
+	GIT CONFIGURATIONS
+
+	 release.<GitHub URL>.accessToken
+	    Access token for a given GitHub server. For instance, the access token for
+	    the public GitHub server in 'release.https://api.github.com/.accessToken'.
+	    Generate a token at 'https://github.com/settings/tokens'.
+	    NOTE: The access token should have the 'repo' scope.
+
+	 release.annotated ($([ "$USING_DEFAULT_CONFIG_ANNOTATED" -ne '0' ] && echo 'Defaulting to' || echo 'Currently:') '${CONFIG_ANNOTATED}')
+	    If 'true', create annotated tags by default. Defaults to '$DEFAULT_CONFIG_ANNOTATED'.
+	    This setting can be overridden to 'true' by specifying -a at the
+	    command line.
+
+	 release.draft ($([ "$USING_DEFAULT_CONFIG_DRAFT" -ne '0' ] && echo 'Defaulting to' || echo 'Currently:') '${CONFIG_DRAFT}')
+	    If 'true', create draft releases by default. Defaults to '$DEFAULT_CONFIG_DRAFT'.
+	    This setting can be overridden to 'true' by specifying -d at the
+	    command line.
+
+	 release.mainBranch $([ -n "$MAIN_BRANCH" ] && echo "(Currently: '$MAIN_BRANCH')")
+	    If set, you will be warned if you attempt to release a commit which is not
+	    in that branch.
+
+	 release.majorLogPattern ($([ "$USING_DEFAULT_MAJOR_LOG_PATTERN" -ne '0' ] && echo 'Defaulting to' || echo 'Currently:') '${MAJOR_LOG_PATTERN}')
+	    A grep extended regular expression which matches git logs for major
+	    version changes. Defaults to '$DEFAULT_MAJOR_LOG_PATTERN'.
+
+	 release.minorLogPattern ($([ "$USING_DEFAULT_MINOR_LOG_PATTERN" -ne '0' ] && echo 'Defaulting to' || echo 'Currently:') '${MINOR_LOG_PATTERN}')
+	    A grep extended regular expression which matches git logs for minor
+	    version changes. Defaults to '$DEFAULT_MINOR_LOG_PATTERN'.
+
+	 release.ticketPattern ($([ "$USING_DEFAULT_TICKET_PATTERN" -ne '0' ] && echo 'Defaulting to' || echo 'Currently:') '${TICKET_PATTERN}')
+	    A grep extended regular expression which matches references to tickets
+	    in the git log. Defaults to '(IOS|JARVIS)-\d+'.
+
+	 release.versionFile $([ -n "$VERFION_FILE" ] && echo "(Currently: '$VERSION_FILE')")
+	    If specified, the version number will be read from the given file, rather
+	    than calculated. This should be a path relative to the top level of the
+	    repository, and must be committed in the repository.
+
+	REQUIREMENTS
+
+	 git              (${GIT:-Install with 'brew install git'})
+	 jq               (${JQ:-Install with 'brew install jq'})
+	 semver           (${SEMVER:-Install from https://gist.github.com/jlawton/ea500042c47823df1ff1d1ace48c10d7})
+	 gh               (${GH:-Install from https://gist.github.com/jlawton/1b4e50779538bcdd22245fecacbf0bd0})
+
+	EOM
+}
+
+# The canonical absolute path for some path
+canonical_path() {
+    local path="$1" ; shift
+    if [[ -d "$path" ]]; then
+        echo "$(cd "$path" ; pwd)"
+    else
+        local b=$(basename "$path")
+        local p=$(dirname "$path")
+        echo "$(cd "$p" ; pwd)/$b"
+    fi
+}
+
+# Load configuration from environment and git
+# This does not include command-line arguments
+configuration() {
+  readonly JQ=$(command -v jq 2> /dev/null)
+  readonly GIT=$(command -v git 2> /dev/null)
+  readonly SEMVER=$(command -v semver 2> /dev/null)
+  readonly GH=$(command -v gh 2> /dev/null)
+
+  readonly USING_DEFAULT_EDITOR=$([ -z "$EDITOR" ] && echo 1 || echo 0)
+  readonly DEFAULT_EDITOR="vim"
+  readonly EDITOR="${EDITOR:-$DEFAULT_EDITOR}"
+  if [[ "$EDITOR" == 'vim' || "$EDITOR" == 'mvim -f' ]]; then
+    readonly USING_VIM=1
+  else
+    readonly USING_VIM=''
+  fi
+
+  readonly GITHUB_RELEASE_URL=$("$GH" --format 'https://api.:server/repos/:owner/:repo/releases' 2> /dev/null)
+  readonly GITHUB_PR_URL=$("$GH" --format 'https://api.:server/repos/:owner/:repo/pulls' 2> /dev/null)
+  readonly GITHUB_ACCESS_TOKEN=$("$GIT" config --get-urlmatch release.accessToken "$GITHUB_RELEASE_URL" 2> /dev/null)
+
+  local AN=$("$GIT" config release.annotated 2> /dev/null)
+  readonly USING_DEFAULT_CONFIG_ANNOTATED=$([ -z "$AN" ] && echo 1 || echo 0)
+  readonly DEFAULT_CONFIG_ANNOTATED='false'
+  readonly CONFIG_ANNOTATED=${AN:-$DEFAULT_CONFIG_ANNOTATED}
+
+  local DF=$("$GIT" config release.draft 2> /dev/null)
+  readonly USING_DEFAULT_CONFIG_DRAFT=$([ -z "$DF" ] && echo 1 || echo 0)
+  readonly DEFAULT_CONFIG_DRAFT='false'
+  readonly CONFIG_DRAFT=${DF:-$DEFAULT_CONFIG_DRAFT}
+
+  readonly MAIN_BRANCH=$("$GIT" config release.mainBranch 2> /dev/null)
+
+  local MJLP=$("$GIT" config release.majorLogPattern 2> /dev/null)
+  readonly USING_DEFAULT_MAJOR_LOG_PATTERN=$([ -z "$MJLP" ] && echo 1 || echo 0)
+  readonly DEFAULT_MAJOR_LOG_PATTERN='\[MAJOR]|MAJOR:'
+  readonly MAJOR_LOG_PATTERN=${MJLP:-$DEFAULT_MAJOR_LOG_PATTERN}
+
+  local MNLP=$("$GIT" config release.minorLogPattern 2> /dev/null)
+  readonly USING_DEFAULT_MINOR_LOG_PATTERN=$([ -z "$MNLP" ] && echo 1 || echo 0)
+  readonly DEFAULT_MINOR_LOG_PATTERN='\[MINOR]|MINOR:'
+  readonly MINOR_LOG_PATTERN=${MNLP:-$DEFAULT_MINOR_LOG_PATTERN}
+
+  local TP=$("$GIT" config release.ticketPattern 2> /dev/null)
+  readonly USING_DEFAULT_TICKET_PATTERN=$([ -z "$TP" ] && echo 1 || echo 0)
+  readonly DEFAULT_TICKET_PATTERN='(IOS|JARVIS)-\d+'
+  readonly TICKET_PATTERN=${TP:-$DEFAULT_TICKET_PATTERN}
+
+  readonly VERSION_FILE=$("$GIT" config release.versionFile 2> /dev/null)
+  readonly GIT_TOPLEVEL=$("$GIT" rev-parse --show-toplevel 2> /dev/null)
+}
+
+configuration
+
+# Process command-line arguments
+while getopts ':ad:hptv:x' opt; do
+  case $opt in
+    a)
+      ARG_ANNOTATED='true'
+      ;;
+    d)
+      ARG_DRAFT=$([ "$OPTARG" == 'true' -o "$OPTARG" == '1' ] && echo 'true' || echo 'false')
+      ;;
+    h)
+      help | LESSSECURE=1 less -XF
+      exit 0
+      ;;
+    p)
+      ARG_PRINT_ONLY='true'
+      ;;
+    t)
+      ARG_TAG_ONLY='true'
+      ;;
+    v)
+      ARG_VERSION="$OPTARG"
+      ;;
+    x)
+      ARG_OFFLINE='true'
+      ARG_TAG_ONLY='true'
+      ;;
+    *)
+      help | LESSSECURE=1 less -XF
+      exit 1
+      ;;
+  esac
+done
+shift $((OPTIND-1))
+
+readonly RELEASE_COMMIT=${1:-HEAD}
+readonly DRAFT=${ARG_DRAFT:-$CONFIG_DRAFT}
+readonly ANNOTATED=${ARG_ANNOTATED:-$CONFIG_ANNOTATED}
+readonly OFFLINE=${ARG_OFFLINE:-false}
+readonly PRINT_ONLY=${ARG_PRINT_ONLY:-false}
+readonly TAG_ONLY=${ARG_TAG_ONLY:-false}
+
+# Check Dependencies
+if [[ -z "$JQ" ]]; then
+  echo "Error: jq required. Install with 'brew install jq'" >&2
+  exit 1
+fi
+if [[ ! -x "$SEMVER" ]]; then
+  echo "Error: semver required. Install from https://gist.github.com/jlawton/ea500042c47823df1ff1d1ace48c10d7" >&2
+  exit 1
+fi
+if [[ ! -x "$GH" ]]; then
+  echo "Error: gh required. Install from https://gist.github.com/jlawton/1b4e50779538bcdd22245fecacbf0bd0" >&2
+  exit 1
+fi
+
+# Check we're trying to process a valid commit
+if ! "$GIT" cat-file -e "$RELEASE_COMMIT^{commit}" 2> /dev/null; then
+  echo "Error: Not a valid commit '$RELEASE_COMMIT'" >&2
+  exit 1
+fi
+# Check the GitHub URL to create a release
+if [[ -z "$GITHUB_RELEASE_URL" ]]; then
+  echo "Error: Unable to create GitHub URL from 'origin'" >&2
+  exit
+fi
+# The GitHub URL to create a release
+if [[ "$OFFLINE" != 'true' ]]; then
+  if [[ -z "$GITHUB_ACCESS_TOKEN" ]]; then
+    echo "Error: No GitHub access token configured for 'origin'" >&2
+    exit
+  fi
+fi
+# Check the version argument
+if [[ -n "$ARG_VERSION" ]]; then
+  if ! "$SEMVER" "$ARG_VERSION" get major > /dev/null 2>&1; then
+    echo "Error: Version is ill-formed: $ARG_VERSION" >&2
+    exit 1
+  fi
+  if [[ "${ARG_VERSION:0:1}" != 'v' ]]; then
+    ARG_VERSION="v$ARG_VERSION"
+  fi
+fi
+
+# Fetch the latest from 'origin'
+if [[ "$OFFLINE" != 'true' ]]; then
+  if ! "$GIT" fetch --tags --prune 2> /dev/null; then
+    echo "Error: Unable to fetch from 'origin'" >&2
+    exit
+  fi
+fi
+
+# Read previous version (this gets the most recent ancestor version tag)
+# We match both annotated and lightweight tags (GitHub produces lightweight
+# tags for releases, if you don't tag first)
+readonly PREV_VERSION=$("$GIT" describe --tags --abbrev=0 --match 'v[0-9]*' --match '[0-9]*' "$RELEASE_COMMIT" 2> /dev/null)
+if [[ -z "$PREV_VERSION" ]]; then
+  echo "Warning: No previous git version tag found." >&2
+  exit 1
+fi
+
+# Scan Git logs for version change specifications
+change_type_from_git_log() {
+  local PREVIOUS="$1"
+  local CURRENT="$2"
+  local CHANGE_TYPE="patch"
+  local MAJOR=$("$GIT" log --pretty='format:1' -E -i --grep="$MAJOR_LOG_PATTERN" --max-count=1 "^$PREVIOUS" "$CURRENT" 2> /dev/null)
+  if [[ ! -z "$MAJOR" ]]; then
+    CHANGE_TYPE="major"
+  else
+    local MINOR=$("$GIT" log --pretty='format:1' -E -i --grep="$MINOR_LOG_PATTERN" --max-count=1 "^$PREVIOUS" "$CURRENT" 2> /dev/null)
+    if [[ ! -z "$MINOR" ]]; then
+      CHANGE_TYPE="minor"
+    fi
+  fi
+  echo "$CHANGE_TYPE"
+}
+
+# Find all of the merged pull requests since the previous version. We could do
+# this by querying the GitHub pull requests API, but I don't think there's a
+# way to limit to merges in a commit range, and I don't want to scan through
+# all the closed PRs. This should be pretty reliable as long as we always merge
+# through GitHub.
+readonly PR_IDS=$("$GIT" log --pretty='format:%s' --grep='^Merge pull request #\d*' "^$PREV_VERSION" "$RELEASE_COMMIT" \
+                | sed -En 's/^Merge pull request #([[:digit:]]*).*$/\1/p')
+
+change_type_from_github_prs() {
+  local IDS="$1"
+  local CHANGE_TYPE="patch"
+  for ID in $(echo $IDS); do
+    local PR_DESC=$(curl -sS -X GET \
+        -H "Authorization: token $GITHUB_ACCESS_TOKEN" \
+        "$GITHUB_PR_URL/$ID" \
+      | jq -r 'select(.merged) | .title + "\n" + .body')
+    local MAJOR=$(echo "$PR_DESC" | grep -E -i -c "$MAJOR_LOG_PATTERN")
+    if [[ "$MAJOR" -gt '0' ]]; then
+      CHANGE_TYPE="minor"
+      break
+    fi
+    local MINOR=$(echo "$PR_DESC" | grep -E -i -c "$MINOR_LOG_PATTERN")
+    if [[ "$MINOR" -gt '0' ]]; then
+      CHANGE_TYPE="minor"
+    fi
+  done
+  echo "$CHANGE_TYPE"
+}
+
+merge_change_types() {
+  if [[ "$1" == 'major' || "$2" == 'major' ]]; then
+    echo 'major'
+  elif [[ "$1" == 'minor' || "$2" == 'minor' ]]; then
+    echo 'minor'
+  else
+    echo 'patch'
+  fi
+}
+
+CHANGE_TYPE=$(change_type_from_git_log "$PREV_VERSION" "$RELEASE_COMMIT")
+
+# TODO: Use GitHub API to grab PR descriptions and look for version tags.
+if [[ "$OFFLINE" != 'true' ]]; then
+  if [[ "$CHANGE_TYPE" != 'major' ]]; then
+    CHANGE_TYPE=$(merge_change_types "$CHANGE_TYPE" "$(change_type_from_github_prs "$PR_IDS")")
+  fi
+fi
+
+# Calculate new release version
+readonly CALCULATED_RELEASE_VERSION="v$("$SEMVER" "$PREV_VERSION" incr "$CHANGE_TYPE")"
+
+if [[ -n "$ARG_VERSION" ]]; then
+  readonly RELEASE_VERSION="$ARG_VERSION"
+elif [[ -n "$VERSION_FILE" ]]; then
+  RELEASE_VERSION=$("$GIT" show "$RELEASE_COMMIT:$VERSION_FILE" 2> /dev/null)
+  if [[ "$?" -ne '0' ]]; then
+    echo "Error: Version file is not committed in the release commit." >&2
+    exit 1
+  fi
+  if ! "$SEMVER" "$RELEASE_VERSION" get major > /dev/null 2>&1; then
+    echo "Error: Version file contains ill-formed version: $RELEASE_VERSION" >&2
+    exit 1
+  fi
+  if [[ "$PREV_VERSION" == "$RELEASE_VERSION" ]]; then
+    echo "Error: Version file needs updating from version $PREV_VERSION" >&2
+    exit 1
+  fi
+  readonly VERSION_FILE_DIRTY="$( (cd "$GIT_TOPLEVEL" ; "$GIT" status -s "$VERSION_FILE") )"
+else
+  readonly RELEASE_VERSION="$CALCULATED_RELEASE_VERSION"
+fi
+
+if [[ "$PRINT_ONLY" == 'true' ]]; then
+  echo "$RELEASE_VERSION"
+  exit 0
+fi
+
+# Look for existing tag
+if [[ -n "$("$GIT" tag --list "$RELEASE_VERSION")" ]]; then
+  # If we're planning to annotate the tag, or it points to the wrong commit,
+  # we don't want to force a change, so error.
+  if [[ "$ANNOTATED" == 'true' || $("$GIT" rev-parse "$RELEASE_COMMIT^{commit}") != "$("$GIT" rev-parse "$RELEASE_VERSION^{commit}")" ]]; then
+    cat >&2 <<- EOM
+		Error: Tag already exists. Cannot annotate or move an existing tag.
+		Hint: If you want to delete the tag, use:
+		  git tag -d '$RELEASE_VERSION' && git push origin ':refs/tags/$RELEASE_VERSION'
+		EOM
+    exit 1
+  fi
+fi
+
+TARGET_COMMITISH="$("$GIT" rev-parse "$RELEASE_COMMIT^{commit}")"
+
+# If we're just creating a lightweight tag, skip the changelog
+if [[ "$TAG_ONLY" == 'true' && "$ANNOTATED" != 'true' ]]; then
+  "$GIT" tag "$RELEASE_VERSION" "$TARGET_COMMITISH"
+  if [[ "$?" -ne 0 ]]; then
+    exit $?
+  fi
+  if [[ "$OFFLINE" != 'true' ]]; then
+    "$GIT" push --quiet origin "refs/tags/$RELEASE_VERSION"
+    exit $?
+  fi
+  exit 0
+fi
+
+# We won't be pushing a tag, so check that the commit is already on 'origin'
+if [[ "$TAG_ONLY" != 'true' && "$ANNOTATED" != 'true' ]]; then
+  if [[ $("$GIT" branch --remotes --contains "$TARGET_COMMITISH" | grep -E -c "^[* ] origin/") -eq '0' ]]; then
+    echo "Error: Commit has not been pushed to 'origin'." >&2
+    exit 1
+  fi
+fi
+
+# Create a change log
+print_changelog() {
+  local PREVIOUS="$1"
+  local CURRENT="$2"
+  local JIRA_TICKETS=$("$GIT" log --pretty='format:%b' "^$PREVIOUS" "$CURRENT" | grep -Eo "$TICKET_PATTERN" | sort | uniq)
+  local UPSTREAM=$("$GIT" rev-parse --abbrev-ref "$CURRENT"@{upstream} 2> /dev/null)
+  local COMMIT_COUNT=$(git rev-list --count "^$PREVIOUS" "$CURRENT" 2> /dev/null)
+
+  cat <<- EOM
+	# Changelog from $PREVIOUS ($("$GIT" rev-parse --short "$PREVIOUS")) to $RELEASE_VERSION ($("$GIT" rev-parse --short "$CURRENT"))
+	# Origin: $("$GIT" remote get-url origin 2> /dev/null)
+	#
+	# Please enter the release message for your changes. Lines starting
+	# with '#' will be ignored, and an empty message aborts the release.
+
+	EOM
+
+  if [[ -n "$MAIN_BRANCH" ]]; then
+    if [[ $("$GIT" branch --contains "$CURRENT" | grep -E -c "^[* ] $MAIN_BRANCH$") -eq '0' ]]; then
+      cat <<- EOM
+			# ⚠️  WARNING: Release commit is not in the main branch ($MAIN_BRANCH).
+			EOM
+    fi
+  fi
+
+  if "$SEMVER" "$CALCULATED_RELEASE_VERSION" '>' "$RELEASE_VERSION" 2> /dev/null ; then
+    cat <<- EOM
+		# ⚠️  WARNING: Calculated version $CALCULATED_RELEASE_VERSION is greater than
+		# the version supplied in the version file.
+		EOM
+  fi
+
+  if [[ -n "$VERSION_FILE_DIRTY" ]]; then
+    cat <<- EOM
+		# ⚠️  WARNING: Version file is dirty. Using committed version.
+		EOM
+  fi
+
+  if [[ "$COMMIT_COUNT" -gt '0' ]]; then
+    cat <<- EOM
+
+		# Github PRs merged: $(echo ${PR_IDS})
+		# JIRA tickets referenced: $(echo ${JIRA_TICKETS})
+
+		Notable changes
+		---------------
+
+		$("$GIT" log --pretty='format: * %s' --no-merges "^$PREVIOUS" "$CURRENT")
+		EOM
+  else
+    cat <<- EOM
+		# ⚠️  WARNING: No commits since the previous version!
+		EOM
+  fi
+
+  # if [[ -n "$("$GIT" status -s)" ]]; then
+  #   cat <<- EOM
+
+	# 	# ⚠️  WARNING: Dirty checkout
+	# 	$("$GIT" status -s | sed -E 's/(.*)/#   \1/')
+	# 	EOM
+  # fi
+
+  if [[ "$COMMIT_COUNT" -gt '0' ]]; then
+    cat <<- EOM
+
+		# On branch $("$GIT" rev-parse --abbrev-ref "$CURRENT")$([ -n "$UPSTREAM" ] && echo " (tracking $UPSTREAM)")
+		# Commits in the release:
+		$("$GIT" log --graph --pretty='format:%h%d %s (%cr) <%aN>' "^$PREVIOUS" "$CURRENT" | sed -E 's/(.*)/#   \1/')
+		EOM
+  fi
+
+}
+
+# Create changelog
+readonly CHANGELOG_FILE=$(mktemp /tmp/release-changelog-${RELEASE_VERSION}.XXXXXX)
+print_changelog "$PREV_VERSION" "$RELEASE_COMMIT" > "$CHANGELOG_FILE"
+
+# Edit
+if [[ "$USING_VIM" ]]; then
+  LINE_NUM="$(grep -nE ' \* ' "$CHANGELOG_FILE" | head -n 1 | cut -f1 -d:)"
+  if [[ "$LINE_NUM" ]]; then
+    $EDITOR "+$LINE_NUM" "$CHANGELOG_FILE"
+  else
+    $EDITOR "$CHANGELOG_FILE"
+  fi
+else
+  $EDITOR "$CHANGELOG_FILE"
+fi
+
+# Strip comments and top and bottom empty lines
+readonly CHANGELOG=$(cat "$CHANGELOG_FILE" \
+  | grep -v '^#\.*' \
+  | "$JQ" -rR --slurp \
+  'sub( "^\\s+[\\r\\n]"; "" ) | sub( "\\s+$"; "" )')
+
+# Clean up
+rm "$CHANGELOG_FILE"
+
+if [[ -z "$CHANGELOG" ]]; then
+  echo "Aborting release due to empty release message."
+  exit
+fi
+
+# Create annotated tag
+if [[ "$ANNOTATED" == 'true' ]]; then
+  [[ "$OFFLINE" != 'true' ]] && \
+  "$GIT" push origin "refs/tags/$RELEASE_VERSION"
+
+  "$GIT" tag -a -m "$CHANGELOG" "$RELEASE_VERSION" "$TARGET_COMMITISH"
+  if [[ "$?" -ne 0 ]]; then
+    exit $?
+  fi
+  if [[ "$OFFLINE" != 'true' ]]; then
+    "$GIT" push --quiet origin "refs/tags/$RELEASE_VERSION"
+    if [[ "$?" -ne 0 ]]; then
+      exit $?
+    fi
+  fi
+  if [[ "$TAG_ONLY" == 'true' ]]; then
+    exit 0
+  fi
+fi
+
+release_json() {
+  local CURRENT="$1"
+  local BODY="$2"
+  printf '%s' "$BODY" \
+    | "$JQ" -R --slurp \
+        --arg rn "$RELEASE_VERSION" \
+        --arg cm "$CURRENT" \
+        --argjson draft "$DRAFT" \
+    '{ "tag_name": $rn, "target_commitish": $cm, "name": $rn, "body": ., "draft": $draft, "prerelease": false }'
+}
+
+# POST to GitHub
+if [[ "$OFFLINE" != 'true' ]]; then
+  readonly RELEASE_JSON=$(release_json "$TARGET_COMMITISH" "$CHANGELOG" \
+    | curl -sS -X POST \
+      -H "Authorization: token $GITHUB_ACCESS_TOKEN" \
+      -H 'Content-Type: application/json' \
+      \
+      -d @- \
+      "$GITHUB_RELEASE_URL")
+
+  readonly RELEASE_HTML_URL=$(echo "$RELEASE_JSON" | "$JQ" -r '.html_url | select(. != null)')
+
+  if [[ -n "$RELEASE_HTML_URL" ]]; then
+    open "$RELEASE_HTML_URL"
+  else
+    echo "Error: Failed to create release." >&2
+    echo "Hint: If you got a Not Found error, check that your access token has the 'repo' scope." >&2
+    echo "$RELEASE_JSON" >&2
+  fi
+fi
