@@ -1,0 +1,98 @@
+#!/usr/bin/env perl -w
+
+use Getopt::Long;
+
+sub main {
+  my $format = undef;
+  GetOptions('format=s', \$format);
+
+  if ($#ARGV > 0) {
+    quit("Usage: $0 [-f <format>] [<directory>]");
+  }
+  my $dir = undef;
+  if ($#ARGV == 0) {
+    $dir = $ARGV[0];
+    chdir($dir) || quit("Not a directory: $dir");
+  }
+
+  my $remote = git_remote();
+  if (!defined($remote)) {
+    if (defined($dir)) {
+      quit("Not a git repository: $dir");
+    } else {
+      quit("Not a git repository");
+    }
+  }
+
+  my $url = remote_to_web_url($remote, $format);
+  if (!defined($url)) {
+    quit("Unable to get web URL for remote: $remote");
+  }
+
+  if (!defined($format)) {
+    open_url($url);
+  } else {
+    print("$url\n");
+  }
+}
+
+sub git_remote {
+  open(GIT, '-|', 'git config --get remote.origin.url');
+  my $url = <GIT>;
+  close(GIT);
+
+  if (defined($url)) {
+    chomp($url);
+  }
+  return $url;
+}
+
+sub remote_to_web_url {
+  my $remote = strip_dot_git($_[0]);
+  my $format = $_[1] || 'https://:server/:owner/:repo';
+
+  my ($server, $owner, $repo);
+  if ($remote =~ m|^git@([^:]+):([^/]+)/(.+)$|) {
+    ($server, $owner, $repo) = ($1, $2, $3);
+  }
+  elsif ($remote =~ m|^https://([^/]+)/([^/]+)/(.+)|) {
+    ($server, $owner, $repo) = ($1, $2, $3);
+  }
+
+  return replace_strings($format, {
+    ':server' => $server,
+    ':owner' => $owner,
+    ':repo' => $repo,
+  });
+}
+
+sub replace_strings {
+  my $format = $_[0];
+  my %replacements = %{$_[1]};
+
+  my $result = $format;
+  $result =~ s/(@{[join "|", map { quotemeta($_) } keys %replacements]})/$replacements{$1}/g;
+  return $result;
+}
+
+sub strip_dot_git {
+  my $path = $_[0];
+  $path =~ s|/$||;
+  $path =~ s|.git$||;
+  return $path;
+}
+
+sub open_url {
+  my $url = $_[0];
+  system('open', $url);
+}
+
+sub quit {
+  my $msg = shift;
+  if (defined($msg)) {
+    print STDERR $msg."\n";
+  }
+  exit(1);
+}
+
+main();
